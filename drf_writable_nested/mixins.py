@@ -14,6 +14,7 @@ from rest_framework.exceptions import ValidationError
 from rest_framework.fields import set_value, SkipField, get_error_detail
 from django.core.exceptions import ValidationError as DjangoValidationError, ObjectDoesNotExist
 from rest_framework.settings import api_settings
+from rest_framework.validators import UniqueValidator
 
 
 class BaseNestedModelSerializer(serializers.ModelSerializer):
@@ -138,10 +139,12 @@ class BaseNestedModelSerializer(serializers.ModelSerializer):
         try:
             related_field = model_class._meta.get_field(field.source)
         except FieldDoesNotExist:
-            # If `related_name` is not set, field name does not include `_set` -> remove it and check again
+            # If `related_name` is not set, field name does not include
+            # `_set` -> remove it and check again
             default_postfix = '_set'
             if field.source.endswith(default_postfix):
-                related_field = model_class._meta.get_field(field.source[:-len(default_postfix)])
+                related_field = model_class._meta.get_field(
+                    field.source[:-len(default_postfix)])
             else:
                 raise
 
@@ -152,9 +155,19 @@ class BaseNestedModelSerializer(serializers.ModelSerializer):
     def _get_serializer_for_field(self, field, **kwargs):
         kwargs.update({
             'context': self.context,
-            'partial': self.partial,
+            'partial': self.partial if kwargs.get('instance') else False,
         })
-        return field.__class__(**kwargs)
+
+        # if field is a polymorphic serializer
+        if hasattr(field, '_get_serializer_from_resource_type'):
+            # get 'real' serializer based on resource type
+            serializer = field._get_serializer_from_resource_type(
+                kwargs.get('data').get(field.resource_type_field_name)
+            )
+
+            return serializer.__class__(**kwargs)
+        else:
+            return field.__class__(**kwargs)
 
     def _get_generic_lookup(self, instance, related_field):
         return {
@@ -163,13 +176,27 @@ class BaseNestedModelSerializer(serializers.ModelSerializer):
             related_field.object_id_field_name: instance.pk,
         }
 
-    def prefetch_related_instances(self, field, related_data):
+    def _get_related_pk(self, data, model_class):
+        pk = data.get('pk') or data.get(model_class._meta.pk.attname)
+
+        if pk:
+            return str(pk)
+
+        return None
+
+    def _extract_related_pks(self, field, related_data):
         model_class = field.Meta.model
         pk_list = []
         for d in filter(None, related_data):
             pk = self._get_related_pk(d, model_class, related_field=field)
             if pk:
                 pk_list.append(pk)
+
+        return pk_list
+
+    def _prefetch_related_instances(self, field, related_data):
+        model_class = field.Meta.model
+        pk_list = self._extract_related_pks(field, related_data)
 
         instances = {
             str(related_instance.pk): related_instance
@@ -316,17 +343,27 @@ class BaseNestedModelSerializer(serializers.ModelSerializer):
             # Skip processing for empty data or not-specified field.
             # The field can be defined in validated_data but isn't defined
             # in initial_data (for example, if multipart form data used)
-            related_data = self.initial_data.get(field_name, None)
+            related_data = self.get_initial().get(field_name, None)
             if related_data is None:
                 continue
 
-            # Expand to array of one item for one-to-one for uniformity
             if related_field.one_to_one:
+                # If an object already exists, fill in the pk so
+                # we don't try to duplicate it
+                pk_name = field.Meta.model._meta.pk.attname
+                if pk_name not in related_data and 'pk' in related_data:
+                    pk_name = 'pk'
+                if pk_name not in related_data:
+                    related_instance = getattr(instance, field_source, None)
+                    if related_instance:
+                        related_data[pk_name] = related_instance.pk
+
+                # Expand to array of one item for one-to-one for uniformity
                 related_data = [related_data]
 
-            instances = self.prefetch_related_instances(field, related_data)
+            instances = self._prefetch_related_instances(field, related_data)
 
-            save_kwargs = self.get_save_kwargs(field_name)
+            save_kwargs = self._get_save_kwargs(field_name)
             if isinstance(related_field, GenericRelation):
                 save_kwargs.update(
                     self._get_generic_lookup(instance, related_field),
@@ -335,6 +372,7 @@ class BaseNestedModelSerializer(serializers.ModelSerializer):
                 save_kwargs[related_field.name] = instance
 
             new_related_instances = []
+            errors = []
             for data in related_data:
                 obj = instances.get(
                     self._get_related_pk(data, field.Meta.model, related_field=field)
@@ -344,10 +382,20 @@ class BaseNestedModelSerializer(serializers.ModelSerializer):
                     instance=obj,
                     data=data,
                 )
-                serializer.is_valid(raise_exception=True)
-                related_instance = serializer.save(**save_kwargs)
-                data['pk'] = related_instance.pk
-                new_related_instances.append(related_instance)
+                try:
+                    serializer.is_valid(raise_exception=True)
+                    related_instance = serializer.save(**save_kwargs)
+                    data['pk'] = related_instance.pk
+                    new_related_instances.append(related_instance)
+                    errors.append({})
+                except ValidationError as exc:
+                    errors.append(exc.detail)
+
+            if any(errors):
+                if related_field.one_to_one:
+                    raise ValidationError({field_name: errors[0]})
+                else:
+                    raise ValidationError({field_name: errors})
 
             # We check if the field was declared as a serializer for the through model.
             # We only need to create new relations if it wasn't.
@@ -379,18 +427,22 @@ class BaseNestedModelSerializer(serializers.ModelSerializer):
                 instance=obj,
                 data=data,
             )
-            serializer.is_valid(raise_exception=True)
-            attrs[field_source] = serializer.save(
-                **self.get_save_kwargs(field_name)
-            )
+
+            try:
+                serializer.is_valid(raise_exception=True)
+                attrs[field_source] = serializer.save(
+                    **self._get_save_kwargs(field_name)
+                )
+            except ValidationError as exc:
+                raise ValidationError({field_name: exc.detail})
 
     def save(self, **kwargs):
-        self.save_kwargs = defaultdict(dict, kwargs)
+        self._save_kwargs = defaultdict(dict, kwargs)
 
         return super(BaseNestedModelSerializer, self).save(**kwargs)
 
-    def get_save_kwargs(self, field_name):
-        save_kwargs = self.save_kwargs[field_name]
+    def _get_save_kwargs(self, field_name):
+        save_kwargs = self._save_kwargs[field_name]
         if not isinstance(save_kwargs, dict):
             raise TypeError(
                 _("Arguments to nested serializer's `save` must be dict's")
@@ -401,7 +453,7 @@ class BaseNestedModelSerializer(serializers.ModelSerializer):
 
 class NestedCreateMixin(BaseNestedModelSerializer):
     """
-    Mixin adds nested create feature
+    Adds nested create feature
     """
 
     def create(self, validated_data):
@@ -423,7 +475,7 @@ class NestedCreateMixin(BaseNestedModelSerializer):
 
 class NestedUpdateMixin(BaseNestedModelSerializer):
     """
-    Mixin adds update nested feature
+    Adds update nested feature
     """
     default_error_messages = {
         'cannot_delete_protected': _(
@@ -460,13 +512,13 @@ class NestedUpdateMixin(BaseNestedModelSerializer):
                 reverse_relations.items():
             model_class = field.Meta.model
 
-            related_data = self.initial_data[field_name]
+            related_data = self.get_initial()[field_name]
             # Expand to array of one item for one-to-one for uniformity
             if related_field.one_to_one:
                 related_data = [related_data]
 
-            # M2M relation can be as direct or as reverse. For direct relation we
-            # should use reverse relation name
+            # M2M relation can be as direct or as reverse. For direct relation
+            # we should use reverse relation name
             if related_field.many_to_many and \
                     not isinstance(related_field, ForeignObjectRel):
                 related_field_lookup = {
@@ -530,3 +582,79 @@ class NestedUpdateMixin(BaseNestedModelSerializer):
                                 f"not-nullable keys to the parent. "
                                 f"If this is a many-to-many relationship, consider adding '{field_name}' "
                                 f"to Meta.allow_delete_on_update in the serializer.")
+
+class UniqueFieldsMixin(serializers.ModelSerializer):
+    """
+    Moves `UniqueValidator`'s from the validation stage to the save stage.
+    It solves the problem with nested validation for unique fields on update.
+
+    If you want more details, you can read related issues and articles:
+    https://github.com/beda-software/drf-writable-nested/issues/1
+    http://www.django-rest-framework.org/api-guide/validators/#updating-nested-serializers
+
+    Example of usage:
+    ```
+        class Child(models.Model):
+        field = models.CharField(unique=True)
+
+
+    class Parent(models.Model):
+        child = models.ForeignKey('Child')
+
+
+    class ChildSerializer(UniqueFieldsMixin, serializers.ModelSerializer):
+        class Meta:
+            model = Child
+
+
+    class ParentSerializer(NestedUpdateMixin, serializers.ModelSerializer):
+        child = ChildSerializer()
+
+        class Meta:
+            model = Parent
+    ```
+
+    Note: `UniqueFieldsMixin` must be applied only on the serializer
+    which has unique fields.
+
+    Note: When you are using both mixins
+    (`UniqueFieldsMixin` and `NestedCreateMixin` or `NestedUpdateMixin`)
+    you should put `UniqueFieldsMixin` ahead.
+    """
+    _unique_fields = []
+
+    def get_fields(self):
+        self._unique_fields = []
+
+        fields = super(UniqueFieldsMixin, self).get_fields()
+        for field_name, field in fields.items():
+            is_unique = any([isinstance(validator, UniqueValidator)
+                             for validator in field.validators])
+            if is_unique:
+                self._unique_fields.append(field_name)
+                field.validators = [
+                    validator for validator in field.validators
+                    if not isinstance(validator, UniqueValidator)]
+
+        return fields
+
+    def _validate_unique_fields(self, validated_data):
+        for field_name in self._unique_fields:
+            unique_validator = UniqueValidator(self.Meta.model.objects.all())
+            try:
+                # `set_context` removed on DRF >= 3.11, pass in via __call__ instead
+                if hasattr(unique_validator, 'set_context'):
+                    unique_validator.set_context(self.fields[field_name])
+                    unique_validator(validated_data[field_name])
+                else:
+                    unique_validator(validated_data[field_name], self.fields[field_name])
+            except ValidationError as exc:
+                raise ValidationError({field_name: exc.detail})
+
+    def create(self, validated_data):
+        self._validate_unique_fields(validated_data)
+        return super(UniqueFieldsMixin, self).create(validated_data)
+
+    def update(self, instance, validated_data):
+        self._validate_unique_fields(validated_data)
+        return super(UniqueFieldsMixin, self).update(instance, validated_data)

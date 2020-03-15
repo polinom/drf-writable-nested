@@ -2,6 +2,9 @@ import uuid
 from rest_framework.exceptions import ValidationError
 from django.test import TestCase
 from django.http.request import QueryDict
+from django.db import transaction
+
+from .utils import get_sample_file
 
 from . import (
     models,
@@ -221,6 +224,112 @@ class WritableNestedModelSerializerTest(TestCase):
         # Sites shouldn't be deleted either as it is M2M
         self.assertEqual(models.Site.objects.count(), 3)
 
+    def test_update_reverse_one_to_one_without_pk(self):
+        serializer = serializers.UserSerializer(data=self.get_initial_data())
+        serializer.is_valid(raise_exception=True)
+        user = serializer.save()
+
+        # Check instances count
+        self.assertEqual(models.User.objects.count(), 1)
+        self.assertEqual(models.Profile.objects.count(), 1)
+        self.assertEqual(models.Site.objects.count(), 2)
+        self.assertEqual(models.Avatar.objects.count(), 2)
+        self.assertEqual(models.Message.objects.count(), 3)
+
+        # Update
+        user_pk = user.pk
+        profile_pk = user.profile.pk
+
+        message_to_update_str_pk = str(user.profile.message_set.first().pk)
+        message_to_update_pk = user.profile.message_set.last().pk
+        serializer = serializers.UserSerializer(
+            instance=user,
+            data={
+                'pk': user_pk,
+                'username': 'new',
+                'profile': {
+                    # omit pk
+                    'access_key': None,
+                    'sites': [
+                        {
+                            'url': 'http://new-site.com',
+                        },
+                    ],
+                    'avatars': [
+                        {
+                            'pk': user.profile.avatars.earliest('pk').pk,
+                            'image': 'old-image-1.png',
+                        },
+                        {
+                            'image': 'new-image-1.png',
+                        },
+                        {
+                            'image': 'new-image-2.png',
+                        },
+                    ],
+                    'message_set': [
+                        {
+                            'pk': message_to_update_str_pk,
+                            'message': 'Old message 1'
+                        },
+                        {
+                            'pk': message_to_update_pk,
+                            'message': 'Old message 2'
+                        },
+                        {
+                            'message': 'New message 1'
+                        }
+                    ],
+                },
+            },
+        )
+
+        serializer.is_valid(raise_exception=True)
+        user = serializer.save()
+        user.refresh_from_db()
+        self.assertIsNotNone(user)
+        self.assertEqual(user.pk, user_pk)
+        self.assertEqual(user.username, 'new')
+
+        profile = user.profile
+        self.assertIsNotNone(profile)
+        self.assertIsNone(profile.access_key)
+        self.assertEqual(profile.pk, profile_pk)
+        self.assertEqual(profile.sites.count(), 1)
+        self.assertSetEqual(
+            set(profile.sites.values_list('url', flat=True)),
+            {'http://new-site.com'}
+        )
+        self.assertEqual(profile.avatars.count(), 3)
+        self.assertSetEqual(
+            set(profile.avatars.values_list('image', flat=True)),
+            {'old-image-1.png', 'new-image-1.png', 'new-image-2.png'}
+        )
+        self.assertSetEqual(
+            set(profile.message_set.values_list('message', flat=True)),
+            {'Old message 1', 'Old message 2', 'New message 1'}
+        )
+        # Check that message which supposed to be updated still in profile
+        # messages (new message wasn't created instead of update)
+        self.assertIn(
+            message_to_update_pk,
+            profile.message_set.values_list('id', flat=True)
+        )
+        self.assertIn(
+            uuid.UUID(message_to_update_str_pk),
+            profile.message_set.values_list('id', flat=True)
+        )
+
+        # Check instances count
+        self.assertEqual(models.User.objects.count(), 1)
+        self.assertEqual(models.Profile.objects.count(), 1)
+        self.assertEqual(models.Avatar.objects.count(), 3)
+        self.assertEqual(models.Message.objects.count(), 3)
+        # Access key shouldn't be removed because it is FK
+        self.assertEqual(models.AccessKey.objects.count(), 1)
+        # Sites shouldn't be deleted either as it is M2M
+        self.assertEqual(models.Site.objects.count(), 3)
+
     def test_update_raise_protected_error(self):
         serializer = serializers.UserSerializer(data=self.get_initial_data())
         serializer.is_valid(raise_exception=True)
@@ -249,10 +358,18 @@ class WritableNestedModelSerializerTest(TestCase):
 
         serializer.is_valid(raise_exception=True)
         with self.assertRaises(ValidationError):
-            serializer.save()
+            # TODO: remove transaction.atomic after #48 will be closed
+            with transaction.atomic():
+                serializer.save()
 
-        # Check that protected avatar haven't been deleted
-        self.assertEqual(models.Avatar.objects.count(), 3)
+        # Check that protected avatar hasn't been deleted
+        self.assertEqual(models.Avatar.objects.count(), 2)
+        self.assertSetEqual(
+            set(models.Avatar.objects.values_list('pk', flat=True)),
+            {
+                user.profile.avatars.first().id,
+                user.profile.avatars.last().id
+            })
 
     def test_update_with_empty_reverse_one_to_one(self):
         serializer = serializers.UserSerializer(data=self.get_initial_data())
@@ -438,6 +555,26 @@ class WritableNestedModelSerializerTest(TestCase):
         # Old access key shouldn't be deleted
         self.assertEqual(models.AccessKey.objects.count(), 2)
 
+    def test_nested_partial_update_failed_with_empty_direct_fk_object(self):
+        serializer = serializers.UserSerializer(data=self.get_initial_data())
+        serializer.is_valid(raise_exception=True)
+        user = serializer.save()
+
+        # Check nested instances is None
+        self.assertIsNone(user.user_avatar)
+
+        serializer = serializers.UserSerializer(
+            instance=user,
+            partial=True,
+            data={
+                'username': 'new',
+                'user_avatar': {},
+            }
+        )
+        serializer.is_valid(raise_exception=True)
+        with self.assertRaises(ValidationError):
+            serializer.save()
+
     def test_update_with_generic_relation(self):
         item = models.TaggedItem.objects.create()
         serializer = serializers.TaggedItemSerializer(
@@ -560,6 +697,16 @@ class WritableNestedModelSerializerTest(TestCase):
         sites = list(user.profile.sites.all())
         self.assertEqual('http://test.com', sites[0].url)
         self.assertEqual('http://test.com', sites[1].url)
+
+    def test_create_with_save_kwargs_failed(self):
+        data = self.get_initial_data()
+        serializer = serializers.UserSerializer(data=data)
+        serializer.is_valid(raise_exception=True)
+
+        with self.assertRaises(TypeError):
+            user = serializer.save(
+                profile=None,
+            )
 
     def test_custom_pk(self):
         data = {
@@ -730,3 +877,53 @@ class WritableNestedModelSerializerTest(TestCase):
 
         self.assertTrue(models.Team.objects.filter(id=team.id).exists())
         self.assertEqual(team.name, 'team')
+
+    def test_create_with_file(self):
+        data = {
+            'page.title': 'some page',
+            'source': get_sample_file(name='sample name')
+        }
+        qdict = QueryDict('', mutable=True)
+        qdict.update(data)
+
+        serializer = serializers.DocumentSerializer(
+            data=qdict
+        )
+        serializer.is_valid(raise_exception=True)
+        doc = serializer.save()
+
+        self.assertTrue(models.Document.objects.filter(pk=doc.pk).exists())
+        self.assertEqual(doc.page.title, 'some page')
+
+
+class WritableNestedModelSerializerIssuesTest(TestCase):
+    def test_issue_86(self):
+        serializer = serializers.I86GenreSerializer(data={
+            'names': [
+                {
+                    'string': 'Genre'
+                }
+            ]
+        })
+        self.assertTrue(serializer.is_valid())
+        instance = serializer.save()
+        
+        update_serializer = serializers.I86GenreSerializer(
+            instance=instance, 
+            data={
+                'id': instance.pk, 
+                'names': [
+                    {
+                        'id': instance.names.first().pk,
+                        'string': 'Genre changed'
+                    }
+                ]
+            }
+        )
+        self.assertTrue(update_serializer.is_valid())
+        update_serializer.save()
+        self.assertEqual(serializer.data['id'], update_serializer.data['id'])
+        self.assertEqual(
+            serializer.data['names'][0]['id'], 
+            update_serializer.data['names'][0]['id'])
+

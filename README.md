@@ -3,6 +3,7 @@ DRF Writable Nested
 [![Build Status](https://travis-ci.org/beda-software/drf-writable-nested.svg?branch=master)](https://travis-ci.org/beda-software/drf-writable-nested)
 [![codecov](https://codecov.io/gh/beda-software/drf-writable-nested/branch/master/graph/badge.svg)](https://codecov.io/gh/beda-software/drf-writable-nested)
 [![pypi](https://img.shields.io/pypi/v/drf-writable-nested.svg)](https://pypi.python.org/pypi/drf-writable-nested)
+[![pyversions](https://img.shields.io/pypi/pyversions/drf-writable-nested.svg)](https://pypi.python.org/pypi/drf-writable-nested)
 
 This is a writable nested model serializer for Django REST Framework which
 allows you to create/update your models with related nested data.
@@ -16,8 +17,8 @@ The following relations are supported:
 Requirements
 ============
 
-- Python (2.7, 3.5, 3.6)
-- Django (1.9, 1.10, 1.11, 2.0)
+- Python (2.7, 3.5, 3.6, 3.7)
+- Django (1.9, 1.10, 1.11, 2.0, 2.1, 2.2)
 - djangorestframework (3.5+)
 
 Installation
@@ -62,7 +63,7 @@ We should create the following list of serializers:
 
 ```python
 from rest_framework import serializers
-from drf_writable_nested import WritableNestedModelSerializer
+from drf_writable_nested.serializers import WritableNestedModelSerializer
 
 
 class AvatarSerializer(serializers.ModelSerializer):
@@ -210,8 +211,57 @@ print(user.profile.access_key.key)
 Note: The same value will be used for all nested instances like default value but with higher priority.
 
 
+Known problems with solutions
+=============================
+
+
+##### Validation problem for nested serializers with unique fields on update
+We have a special mixin `UniqueFieldsMixin` which solves this problem.
+The mixin moves` UniqueValidator`'s from the validation stage to the save stage.
+
+If you want more details, you can read related issues and articles:
+https://github.com/beda-software/drf-writable-nested/issues/1
+http://www.django-rest-framework.org/api-guide/validators/#updating-nested-serializers
+
+###### Example of usage:
+```python
+class Child(models.Model):
+    field = models.CharField(unique=True)
+
+
+class Parent(models.Model):
+    child = models.ForeignKey('Child')
+
+
+class ChildSerializer(UniqueFieldsMixin, serializers.ModelSerializer):
+    class Meta:
+        model = Child
+
+
+class ParentSerializer(NestedUpdateMixin, serializers.ModelSerializer):
+    child = ChildSerializer()
+
+    class Meta:
+        model = Parent
+```
+
+Note: `UniqueFieldsMixin` must be applied only on serializer
+which has unique fields.
+
+###### Mixin ordering
+When you are using both mixins
+(`UniqueFieldsMixin` and `NestedCreateMixin` or `NestedUpdateMixin`)
+you should put `UniqueFieldsMixin` ahead.
+
+For example:
+```python
+class ChildSerializer(UniqueFieldsMixin, NestedUpdateMixin,
+        serializers.ModelSerializer):
+```
+
+
+
 
 Authors
 =======
-2014-2018, beda.software
-
+2014-2019, beda.software

@@ -56,7 +56,7 @@ class Team(models.Model):
 
 class CustomPK(models.Model):
     slug = models.SlugField(
-        primary_key=True,
+        unique=True
     )
     user = models.ForeignKey(
         User,
@@ -86,3 +86,64 @@ class AnotherAvatar(models.Model):
     image = models.CharField(max_length=100)
     profile = models.ForeignKey(
         AnotherProfile, on_delete=models.CASCADE, related_name='avatars',)
+
+
+class Page(models.Model):
+    title = models.CharField(max_length=80)
+
+
+class Document(models.Model):
+    page = models.ForeignKey(Page, on_delete=models.CASCADE)
+    source = models.FileField()
+
+
+# Models for UniqueFieldsMixin
+
+class UFMChild(models.Model):
+    field = models.CharField(max_length=50, unique=True)
+
+
+class UFMParent(models.Model):
+    child = models.ForeignKey(UFMChild, on_delete=models.CASCADE)
+
+
+# Models for different relations
+
+class ForeignKeyChild(models.Model):
+    pass
+
+
+class ForeignKeyParent(models.Model):
+    child = models.ForeignKey(ForeignKeyChild,
+                              on_delete=models.CASCADE,
+                              related_name='parents')
+
+
+class OneToOneChild(models.Model):
+    pass
+
+
+class OneToOneParent(models.Model):
+    child = models.OneToOneField(OneToOneChild,
+                                 on_delete=models.CASCADE,
+                                 related_name='parent')
+
+
+class ManyToManyChild(models.Model):
+    pass
+
+
+class ManyToManyParent(models.Model):
+    children = models.ManyToManyField(ManyToManyChild, related_name='parents')
+
+
+class I86Name(models.Model):
+    string = models.TextField()
+    item = models.ForeignKey(
+        'I86Genre', on_delete=models.CASCADE, related_name='names', 
+        blank=True, null=True)
+
+
+class I86Genre(models.Model):
+    pass
+
