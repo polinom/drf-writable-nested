@@ -1,3 +1,26 @@
+## 0.5.4
+* Update UniqueFieldsMixin to support DRF 3.11 validator context API (@mands)
+
+## 0.5.3
+* Support custom resource_type_field_name for polymorphic serialize (@tsaipoan)
+
+## 0.5.2
+* Feature: Enable support for nested polymorphic relations #81 (@csdenboer)
+
+## 0.5.1
+* Fix: Validate nested field before creating it even in partial update (@yuekui) 
+* Fix some potential issues  in the delete phase for reverse relations update
+
+## 0.5.0
+* Workaround: Validation problem: `parent` isn't set for nested serializer's fields on the validation stage #1 (@kenny1992)
+* Fix: Validation problem: custom validation errors raised from the nested serializer have a wrong path #2 (@kenny1992)
+
+## 0.4.3
+* Fix MultiValueDictKeyError for nested updates on reverse-relations  (@bakerf @projkov)
+
+## 0.4.2
+* Allow child one-to-one instances to be updated without providing PK (@karamanolev @cjroth @mathieuseguin)
+
 ## 0.4.1
 * Changed setup config for PyPI
 
